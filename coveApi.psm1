@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.0.0
+# coveApi.psm1 - v1.1.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,12 +11,15 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version      = "1.0.0"
-$script:apiUrl       = "https://api.backup.management/jsonapi"
-$script:reportingUrl = "https://api.backup.management/reporting_api"
-$script:visa         = $null
-$script:partnerId    = 0
-$script:modulePath   = Join-Path $PSScriptRoot 'coveApi.psm1'
+$script:version       = "1.1.0"
+$script:apiUrl        = "https://api.backup.management/jsonapi"
+$script:reportingUrl  = "https://api.backup.management/reporting_api"
+$script:visa          = $null
+$script:partnerId     = 0
+$script:modulePath    = Join-Path $PSScriptRoot 'coveApi.psm1'
+$script:httpClient    = [System.Net.Http.HttpClient]::new()
+$script:httpClient.Timeout = [TimeSpan]::FromSeconds(30)
+$script:endpointCache = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
 
 # ============================================================
 # Private helpers
@@ -305,33 +308,43 @@ function Get-CoveDevices {
 
 # Returns Name, Token, and RepservUrl for a device account.
 # RepservUrl is derived from EnumerateAccountRemoteAccessEndpoints.
+# Both API calls are issued simultaneously via HttpClient async tasks.
+# Results are cached in module scope - repeated calls for the same AccountId
+# within the same session (or thread job) return immediately from cache.
 # Returns $null if the account cannot be resolved.
 function Get-CoveAccountInfo {
     param(
         [Parameter(Mandatory)][int]$AccountId,
         [string]$Visa = $script:visa
     )
-    try {
-        $restParams = @{
-            Uri         = $script:apiUrl
-            Method      = 'Post'
-            ContentType = 'application/json'
-            TimeoutSec  = 15
-        }
 
-        $restParams.Body = @{
+    if ($script:endpointCache.ContainsKey($AccountId)) {
+        return $script:endpointCache[$AccountId]
+    }
+
+    try {
+        $infoBody = @{
             jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
             method  = 'GetAccountInfoById'
             params  = @{ accountId = $AccountId }
         } | ConvertTo-Json -Depth 5 -Compress
-        $infoResp = Invoke-RestMethod @restParams
 
-        $restParams.Body = @{
+        $epBody = @{
             jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
             method  = 'EnumerateAccountRemoteAccessEndpoints'
             params  = @{ accountId = $AccountId }
         } | ConvertTo-Json -Depth 5 -Compress
-        $epResp = Invoke-RestMethod @restParams
+
+        $c1 = [System.Net.Http.StringContent]::new($infoBody, [Text.Encoding]::UTF8, 'application/json')
+        $c2 = [System.Net.Http.StringContent]::new($epBody,   [Text.Encoding]::UTF8, 'application/json')
+
+        $t1 = $script:httpClient.PostAsync($script:apiUrl, $c1)
+        $t2 = $script:httpClient.PostAsync($script:apiUrl, $c2)
+
+        [System.Threading.Tasks.Task]::WhenAll($t1, $t2) | Out-Null
+
+        $infoResp = $t1.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+        $epResp   = $t2.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json
 
         $info = $infoResp.result.result
         if (-not $info) { return $null }
@@ -343,7 +356,9 @@ function Get-CoveAccountInfo {
             $repservUrl = "$($webRcgUri.Scheme)://$($webRcgUri.Host)/repserv_json"
         }
 
-        return @{ Name = $info.Name; Token = $info.Token; RepservUrl = $repservUrl }
+        $result = @{ Name = $info.Name; Token = $info.Token; RepservUrl = $repservUrl }
+        [void]$script:endpointCache.TryAdd($AccountId, $result)
+        return $result
     } catch { return $null }
 }
 
