@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.2.0
+# coveApi.psm1 - v1.3.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,7 +11,7 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version       = "1.2.0"
+$script:version       = "1.3.0"
 $script:apiUrl        = "https://api.backup.management/jsonapi"
 $script:reportingUrl  = "https://api.backup.management/reporting_api"
 $script:visa          = $null
@@ -19,6 +19,7 @@ $script:partnerId     = 0
 $script:modulePath    = Join-Path $PSScriptRoot 'coveApi.psm1'
 $script:endpointCache = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
 $script:partnerCache  = [System.Collections.Concurrent.ConcurrentDictionary[long,object]]::new()
+$script:credential    = $null
 
 # ============================================================
 # Private helpers
@@ -42,6 +43,28 @@ function Invoke-WithRetry {
             Write-Verbose "Attempt $attempt failed. Retrying in ${delay}s..."
             Start-Sleep -Seconds $delay
         }
+    }
+}
+
+# Returns $true if a JSON-RPC response body indicates an auth failure.
+function Test-CoveAuthError {
+    param($Response)
+    if (-not $Response -or -not $Response.error) { return $false }
+    $msg = [string]$Response.error.message
+    return $msg -imatch 'visa|session|expired|unauthorized|not authenticated'
+}
+
+# Re-authenticates using the stored credential. Returns $true on success.
+function Invoke-CoveReAuth {
+    if (-not $script:credential) { return $false }
+    try {
+        $plain = $script:credential.GetNetworkCredential().Password
+        Connect-CoveApi -Username $script:credential.UserName -Password $plain | Out-Null
+        Write-Verbose "Re-auth successful - visa refreshed"
+        return $true
+    } catch {
+        Write-Verbose "Re-auth failed: $_"
+        return $false
     }
 }
 
@@ -103,10 +126,12 @@ function Initialize-CoveApi {
 function Set-CoveSession {
     param(
         [Parameter(Mandatory)][string]$Visa,
-        [Parameter(Mandatory)][long]$PartnerId
+        [Parameter(Mandatory)][long]$PartnerId,
+        [PSCredential]$Credential = $null
     )
-    $script:visa      = $Visa
-    $script:partnerId = $PartnerId
+    $script:visa       = $Visa
+    $script:partnerId  = $PartnerId
+    if ($Credential) { $script:credential = $Credential }
 }
 
 # ============================================================
@@ -116,8 +141,15 @@ function Set-CoveSession {
 function Connect-CoveApi {
     param(
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password
+        [Parameter(Mandatory)][string]$Password,
+        [switch]$StoreForReAuth
     )
+    if ($StoreForReAuth) {
+        $script:credential = [PSCredential]::new(
+            $Username,
+            ($Password | ConvertTo-SecureString -AsPlainText -Force)
+        )
+    }
     $body = @{
         jsonrpc = '2.0'; id = 'jsonrpc'; method = 'Login'
         params  = @{ username = $Username; password = $Password }
@@ -173,7 +205,17 @@ function Invoke-CoveJsonrpc {
         Body        = $body
         TimeoutSec  = 30
     }
-    return Invoke-WithRetry { Invoke-RestMethod @reqParams }
+    $resp = Invoke-WithRetry { Invoke-RestMethod @reqParams }
+
+    if (Test-CoveAuthError $resp -and (Invoke-CoveReAuth)) {
+        $reqParams.Body = [ordered]@{
+            jsonrpc = '2.0'; id = 'jsonrpc'; visa = $script:visa
+            method  = $Method;  params = $Params
+        } | ConvertTo-Json -Depth 10 -Compress
+        $resp = Invoke-WithRetry { Invoke-RestMethod @reqParams }
+    }
+
+    return $resp
 }
 
 # ============================================================
@@ -203,6 +245,7 @@ function Invoke-CoveParallel {
     $reportingUrl = $script:reportingUrl
     $visa         = $script:visa
     $partnerId    = $script:partnerId
+    $credential   = $script:credential
     # Strip the caller's SessionState binding so the block runs in the thread
     # job's scope rather than the script scope where it was defined.
     $safeBlock    = [scriptblock]::Create($ScriptBlock.ToString())
@@ -228,7 +271,7 @@ function Invoke-CoveParallel {
             param($i)
             Import-Module $using:modPath
             Initialize-CoveApi -ApiUrl $using:apiUrl -ReportingUrl $using:reportingUrl
-            Set-CoveSession -Visa $using:visa -PartnerId $using:partnerId
+            Set-CoveSession -Visa $using:visa -PartnerId $using:partnerId -Credential $using:credential
             & $using:safeBlock $i
         } -ArgumentList $item
 
