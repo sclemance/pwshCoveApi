@@ -1,6 +1,6 @@
 # pwshCoveApi
 
-PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.2.0**
+PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.3.0**
 
 Provides authentication, device enumeration, partner and per-device queries, and a parallel execution engine that handles visa distribution to thread jobs automatically.
 
@@ -65,7 +65,9 @@ Call before `Connect-CoveApi` if you need non-default endpoints.
 
 #### `Connect-CoveApi`
 
-Logs in and stores the visa and partner ID in module scope. Returns `{Visa, PartnerId}`.
+Logs in and stores the visa, partner ID, and a `SecureString`-backed credential in module scope. Returns `{Visa, PartnerId}`.
+
+The stored credential is used for automatic visa re-auth: if any API call returns an auth error (expired visa), the module re-authenticates transparently and retries the call once. This works in both direct calls and inside `Invoke-CoveParallel` thread jobs.
 
 ```powershell
 $session = Connect-CoveApi -Username 'user@example.com' -Password 'secret'
