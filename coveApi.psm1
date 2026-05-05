@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.1.0
+# coveApi.psm1 - v1.1.1
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,14 +11,12 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version       = "1.1.0"
+$script:version       = "1.1.1"
 $script:apiUrl        = "https://api.backup.management/jsonapi"
 $script:reportingUrl  = "https://api.backup.management/reporting_api"
 $script:visa          = $null
 $script:partnerId     = 0
 $script:modulePath    = Join-Path $PSScriptRoot 'coveApi.psm1'
-$script:httpClient    = [System.Net.Http.HttpClient]::new()
-$script:httpClient.Timeout = [TimeSpan]::FromSeconds(30)
 $script:endpointCache = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
 
 # ============================================================
@@ -308,7 +306,7 @@ function Get-CoveDevices {
 
 # Returns Name, Token, and RepservUrl for a device account.
 # RepservUrl is derived from EnumerateAccountRemoteAccessEndpoints.
-# Both API calls are issued simultaneously via HttpClient async tasks.
+# Both API calls run simultaneously via ForEach-Object -Parallel.
 # Results are cached in module scope - repeated calls for the same AccountId
 # within the same session (or thread job) return immediately from cache.
 # Returns $null if the account cannot be resolved.
@@ -323,31 +321,30 @@ function Get-CoveAccountInfo {
     }
 
     try {
-        $infoBody = @{
-            jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
-            method  = 'GetAccountInfoById'
-            params  = @{ accountId = $AccountId }
-        } | ConvertTo-Json -Depth 5 -Compress
+        $apiUrl = $script:apiUrl
+        $visa   = $Visa
 
-        $epBody = @{
-            jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
-            method  = 'EnumerateAccountRemoteAccessEndpoints'
-            params  = @{ accountId = $AccountId }
-        } | ConvertTo-Json -Depth 5 -Compress
+        $responses = @(
+            [PSCustomObject]@{ id = 'info'; method = 'GetAccountInfoById';                    params = @{ accountId = $AccountId } },
+            [PSCustomObject]@{ id = 'ep';   method = 'EnumerateAccountRemoteAccessEndpoints'; params = @{ accountId = $AccountId } }
+        ) | ForEach-Object -Parallel {
+            $req  = $_
+            $body = @{
+                jsonrpc = '2.0'; id = $req.id; visa = $using:visa
+                method  = $req.method; params = $req.params
+            } | ConvertTo-Json -Depth 5 -Compress
+            $resp = Invoke-RestMethod -Uri $using:apiUrl -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15
+            [PSCustomObject]@{ Id = $req.id; Response = $resp }
+        } -ThrottleLimit 2
 
-        $c1 = [System.Net.Http.StringContent]::new($infoBody, [Text.Encoding]::UTF8, 'application/json')
-        $c2 = [System.Net.Http.StringContent]::new($epBody,   [Text.Encoding]::UTF8, 'application/json')
-
-        $t1 = $script:httpClient.PostAsync($script:apiUrl, $c1)
-        $t2 = $script:httpClient.PostAsync($script:apiUrl, $c2)
-
-        [System.Threading.Tasks.Task]::WhenAll($t1, $t2) | Out-Null
-
-        $infoResp = $t1.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json
-        $epResp   = $t2.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+        $infoResp = ($responses | Where-Object Id -eq 'info').Response
+        $epResp   = ($responses | Where-Object Id -eq 'ep').Response
 
         $info = $infoResp.result.result
-        if (-not $info) { return $null }
+        if (-not $info) {
+            Write-Verbose "Get-CoveAccountInfo: GetAccountInfoById returned no result for AccountId $AccountId"
+            return $null
+        }
 
         $repservUrl = $null
         $endpoints  = $epResp.result.result
@@ -359,7 +356,10 @@ function Get-CoveAccountInfo {
         $result = @{ Name = $info.Name; Token = $info.Token; RepservUrl = $repservUrl }
         [void]$script:endpointCache.TryAdd($AccountId, $result)
         return $result
-    } catch { return $null }
+    } catch {
+        Write-Verbose "Get-CoveAccountInfo error for AccountId $AccountId`: $_"
+        return $null
+    }
 }
 
 # ============================================================
