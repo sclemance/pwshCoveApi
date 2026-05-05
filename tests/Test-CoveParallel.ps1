@@ -1,11 +1,15 @@
 #Requires -Version 7.4
-# Tests Invoke-CoveParallel: verifies module state is initialized in thread jobs
-# and that results are collected correctly. Uses Get-CoveDevices as the data source
-# and a lightweight script block to avoid hammering the repserv endpoints.
+# Tests Invoke-CoveParallel: verifies module state is initialized in thread jobs,
+# results are collected correctly, and demonstrates real speedup by calling
+# Get-CoveAccountInfo (a live HTTP call) for each device.
+#
+# Run order — parallel first, sequential second — keeps both runs cold:
+# thread jobs have isolated module scope and don't populate the parent's
+# endpoint cache, so sequential sees the same cold cache state.
 param(
     [string]$Username,
     [string]$Password,
-    [int]$DeviceLimit   = 10,
+    [int]$DeviceLimit   = 30,
     [int]$ThrottleLimit = 5
 )
 
@@ -26,32 +30,64 @@ $allDevices = Get-CoveDevices -Columns @('AU', 'AB')
 $devices    = @($allDevices | Select-Object -First $DeviceLimit)
 Write-Host "  $($devices.Count) devices selected" -ForegroundColor Gray
 
-# Verify module state is accessible inside thread jobs by calling Get-CovePartnerId
-# and Get-CoveVisa from within the script block. If Invoke-CoveParallel fails to
-# initialize the session, these return 0 / $null.
+# Real HTTP work per device — one JSON-RPC call to GetAccountInfoById.
+# Deliberately uses Invoke-CoveJsonrpc (a flat HTTP call) rather than
+# Get-CoveAccountInfo, which uses ForEach-Object -Parallel internally and
+# breaks when nested inside Start-ThreadJob runspaces.
+# Created via [scriptblock]::Create so it carries no SessionState binding and
+# executes in the invoking scope — the thread job's scope for parallel runs,
+# the script scope for the sequential run.
+$workBlock = [scriptblock]::Create(@'
+param($device)
+$resp = Invoke-CoveJsonrpc -Method 'GetAccountInfoById' -Params @{ accountId = $device.AccountId }
+[PSCustomObject]@{
+    AccountId = $device.AccountId
+    Name      = $device.Name
+    Resolved  = $null -ne $resp.result.result
+    PartnerId = Get-CovePartnerId
+    HasVisa   = -not [string]::IsNullOrEmpty((Get-CoveVisa))
+}
+'@)
+
+# --- Parallel run (first — cache cold, jobs have isolated scope) ---
 Write-Host "Running Invoke-CoveParallel (ThrottleLimit $ThrottleLimit)..." -ForegroundColor Cyan
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$swPar  = [System.Diagnostics.Stopwatch]::StartNew()
+$parResults = Invoke-CoveParallel -Items $devices -ThrottleLimit $ThrottleLimit -ScriptBlock $workBlock
+$swPar.Stop()
+Write-Host "  Elapsed: $($swPar.ElapsedMilliseconds) ms" -ForegroundColor Gray
 
-$results = Invoke-CoveParallel -Items $devices -ThrottleLimit $ThrottleLimit -ScriptBlock {
-    param($device)
-    [PSCustomObject]@{
-        AccountId = $device.AccountId
-        Name      = $device.Name
-        PartnerId = Get-CovePartnerId   # non-zero only if session state was initialized
-        HasVisa   = -not [string]::IsNullOrEmpty((Get-CoveVisa))
-    }
+# --- Sequential run (second — parent cache still cold; parallel jobs didn't populate it) ---
+Write-Host "Running sequential (foreach)..." -ForegroundColor Cyan
+$swSeq = [System.Diagnostics.Stopwatch]::StartNew()
+$seqResults = foreach ($device in $devices) { & $workBlock $device }
+$swSeq.Stop()
+Write-Host "  Elapsed: $($swSeq.ElapsedMilliseconds) ms" -ForegroundColor Gray
+
+# --- Timing comparison ---
+$parMs = $swPar.ElapsedMilliseconds
+$seqMs = $swSeq.ElapsedMilliseconds
+if ($parMs -gt 0) { $ratio = [math]::Round($seqMs / $parMs, 2) } else { $ratio = 'N/A' }
+Write-Host ""
+Write-Host "  Parallel   : $parMs ms" -ForegroundColor White
+Write-Host "  Sequential : $seqMs ms" -ForegroundColor White
+Write-Host "  Speedup    : ${ratio}x" -ForegroundColor $(if ($ratio -ne 'N/A' -and $ratio -gt 1) { 'Green' } else { 'Yellow' })
+Write-Host ""
+
+# --- Validate parallel results ---
+# Session-state correctness uses in-memory checks (PartnerId/HasVisa) — reliable
+# regardless of transient HTTP failures under concurrent load.
+# Resolved mismatches are reported as warnings only, since a parallel HTTP call
+# can fail transiently even when session state is fine.
+$failures  = @()
+$warnings  = @()
+$seqMap    = @{}
+foreach ($r in $seqResults) { if ($r) { $seqMap[[int]$r.AccountId] = $r } }
+
+if ($parResults.Count -ne $devices.Count) {
+    $failures += "Expected $($devices.Count) results, got $($parResults.Count)"
 }
 
-$sw.Stop()
-Write-Host "  Elapsed: $($sw.ElapsedMilliseconds) ms" -ForegroundColor Gray
-
-$failures = @()
-
-if ($results.Count -ne $devices.Count) {
-    $failures += "Expected $($devices.Count) results, got $($results.Count)"
-}
-
-foreach ($r in $results) {
+foreach ($r in $parResults) {
     if (-not $r) {
         $failures += "A result was null (job likely threw)"
         continue
@@ -62,12 +98,19 @@ foreach ($r in $results) {
     if (-not $r.HasVisa) {
         $failures += "AccountId $($r.AccountId): visa was empty in job"
     }
+    $seqR = $seqMap[[int]$r.AccountId]
+    if ($seqR -and $seqR.Resolved -and -not $r.Resolved) {
+        $warnings += "AccountId $($r.AccountId): resolved in sequential but not in parallel (likely transient)"
+    }
 }
 
 if ($failures.Count -gt 0) {
-    foreach ($f in $failures) { Write-Host "[FAIL] $f" -ForegroundColor Red }
+    foreach ($f in $failures) { Write-Host "  [FAIL] $f" -ForegroundColor Red }
     exit 1
 }
+foreach ($w in $warnings) { Write-Host "  [WARN] $w" -ForegroundColor Yellow }
 
-Write-Host "  All $($results.Count) jobs returned correct session state" -ForegroundColor Green
+$resolved = @($parResults | Where-Object { $_.Resolved }).Count
+Write-Host "  $resolved/$($parResults.Count) devices resolved account info" -ForegroundColor Green
+Write-Host "  All $($parResults.Count) jobs had correct session state" -ForegroundColor Green
 Write-Host "Invoke-CoveParallel OK" -ForegroundColor Green

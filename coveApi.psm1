@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.1.1
+# coveApi.psm1 - v1.2.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,13 +11,14 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version       = "1.1.1"
+$script:version       = "1.2.0"
 $script:apiUrl        = "https://api.backup.management/jsonapi"
 $script:reportingUrl  = "https://api.backup.management/reporting_api"
 $script:visa          = $null
 $script:partnerId     = 0
 $script:modulePath    = Join-Path $PSScriptRoot 'coveApi.psm1'
 $script:endpointCache = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
+$script:partnerCache  = [System.Collections.Concurrent.ConcurrentDictionary[long,object]]::new()
 
 # ============================================================
 # Private helpers
@@ -165,14 +166,14 @@ function Invoke-CoveJsonrpc {
         params  = $Params
     } | ConvertTo-Json -Depth 10 -Compress
 
-    $params = @{
+    $reqParams = @{
         Uri         = $script:apiUrl
         Method      = 'Post'
         ContentType = 'application/json'
         Body        = $body
         TimeoutSec  = 30
     }
-    return Invoke-RestMethod @params
+    return Invoke-WithRetry { Invoke-RestMethod @reqParams }
 }
 
 # ============================================================
@@ -202,6 +203,9 @@ function Invoke-CoveParallel {
     $reportingUrl = $script:reportingUrl
     $visa         = $script:visa
     $partnerId    = $script:partnerId
+    # Strip the caller's SessionState binding so the block runs in the thread
+    # job's scope rather than the script scope where it was defined.
+    $safeBlock    = [scriptblock]::Create($ScriptBlock.ToString())
 
     $jobs    = [System.Collections.Generic.List[object]]::new()
     $results = [System.Collections.Generic.List[object]]::new()
@@ -225,7 +229,7 @@ function Invoke-CoveParallel {
             Import-Module $using:modPath
             Initialize-CoveApi -ApiUrl $using:apiUrl -ReportingUrl $using:reportingUrl
             Set-CoveSession -Visa $using:visa -PartnerId $using:partnerId
-            & $using:ScriptBlock $i
+            & $using:safeBlock $i
         } -ArgumentList $item
 
         [void]$jobs.Add($job)
@@ -242,6 +246,35 @@ function Invoke-CoveParallel {
 # ============================================================
 # Partner
 # ============================================================
+
+# Returns the raw GetPartnerInfoById result for a partner (Name, Type, etc.).
+# Defaults to the logged-in partner. Results are cached — repeated calls for the
+# same PartnerId within the same session return immediately from cache.
+# Returns $null if the partner cannot be resolved.
+function Get-CovePartnerInfo {
+    param(
+        [long]$PartnerId = $script:partnerId,
+        [string]$Visa    = $script:visa
+    )
+
+    if ($script:partnerCache.ContainsKey($PartnerId)) {
+        return $script:partnerCache[$PartnerId]
+    }
+
+    try {
+        $resp = Invoke-CoveJsonrpc -Method 'GetPartnerInfoById' -Params @{ partnerId = $PartnerId } -Visa $Visa
+        $info = $resp.result.result
+        if (-not $info) {
+            Write-Verbose "Get-CovePartnerInfo: no result for PartnerId $PartnerId"
+            return $null
+        }
+        [void]$script:partnerCache.TryAdd($PartnerId, $info)
+        return $info
+    } catch {
+        Write-Verbose "Get-CovePartnerInfo error for PartnerId $PartnerId`: $_"
+        return $null
+    }
+}
 
 # Returns MainColor and ProductName from the partner web branding archive.
 # Returns $null on failure.
@@ -321,24 +354,8 @@ function Get-CoveAccountInfo {
     }
 
     try {
-        $apiUrl = $script:apiUrl
-        $visa   = $Visa
-
-        $responses = @(
-            [PSCustomObject]@{ id = 'info'; method = 'GetAccountInfoById';                    params = @{ accountId = $AccountId } },
-            [PSCustomObject]@{ id = 'ep';   method = 'EnumerateAccountRemoteAccessEndpoints'; params = @{ accountId = $AccountId } }
-        ) | ForEach-Object -Parallel {
-            $req  = $_
-            $body = @{
-                jsonrpc = '2.0'; id = $req.id; visa = $using:visa
-                method  = $req.method; params = $req.params
-            } | ConvertTo-Json -Depth 5 -Compress
-            $resp = Invoke-RestMethod -Uri $using:apiUrl -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15
-            [PSCustomObject]@{ Id = $req.id; Response = $resp }
-        } -ThrottleLimit 2
-
-        $infoResp = ($responses | Where-Object Id -eq 'info').Response
-        $epResp   = ($responses | Where-Object Id -eq 'ep').Response
+        $infoResp = Invoke-CoveJsonrpc -Method 'GetAccountInfoById'                    -Params @{ accountId = $AccountId } -Visa $Visa
+        $epResp   = Invoke-CoveJsonrpc -Method 'EnumerateAccountRemoteAccessEndpoints' -Params @{ accountId = $AccountId } -Visa $Visa
 
         $info = $infoResp.result.result
         if (-not $info) {
@@ -561,85 +578,83 @@ function Get-CoveM365Errors {
         }
         if (-not $AccountToken) { return $emptyFail }
 
-        $reportingHeaders = @{ Authorization = "Bearer $currentVisa" }
-        $cutoffTs         = [long]((Get-Date).AddDays(-90) - [DateTime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)).TotalSeconds
-        $allErrors        = @()
-        $m365SrcErrors    = @()
+        $repUrl   = $script:reportingUrl
+        $cutoffTs = [long]((Get-Date).AddDays(-90) - [DateTime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)).TotalSeconds
+        $initVisa = $currentVisa
 
-        foreach ($ds in $activeDs) {
-            $dsType  = $ds.Value
-            $errBody = @{
+        # Fetch all active data sources in parallel; aggregate sequentially after.
+        $dsResponses = @($activeDs) | ForEach-Object -Parallel {
+            $ds     = $_
+            $dsType = $ds.Value
+            $body   = @{
                 jsonrpc = '2.0'; id = 'jsonrpc'
                 method  = 'EnumerateSessionErrors'
                 params  = @{
-                    accountToken   = $AccountToken
+                    accountToken   = $using:AccountToken
                     dataSourceType = $dsType
-                    filter         = @{ SessionType = 'Backup'; TimestampFrom = $cutoffTs }
+                    filter         = @{ SessionType = 'Backup'; TimestampFrom = $using:cutoffTs }
                     range          = @{ Offset = 0; Size = 50 }
                 }
             } | ConvertTo-Json -Depth 10 -Compress
-
             try {
-                $errParams = @{
-                    Uri         = $script:reportingUrl
-                    Method      = 'Post'
-                    Body        = $errBody
-                    ContentType = 'application/json'
-                    Headers     = $reportingHeaders
-                    TimeoutSec  = 10
-                }
-                $response = Invoke-RestMethod @errParams
-                if ($response.visa) {
-                    $currentVisa      = $response.visa
-                    $reportingHeaders = @{ Authorization = "Bearer $currentVisa" }
-                }
-                if ($response.error) { continue }
-
-                $dsResults  = @($response.result.result)
-                if ($dsResults.Count -eq 0) { continue }
-
-                $maxSession = ($dsResults | Measure-Object -Property SessionId -Maximum).Maximum
-                $latestRaw  = $dsResults | Where-Object { $_.SessionId -eq $maxSession }
-
-                foreach ($err in $latestRaw) {
-                    $desc     = try { $err.Description | ConvertFrom-Json } catch { $null }
-                    $descText = if ($desc -and $desc.description) { $desc.description } elseif ($err.Description) { $err.Description } else { '(unknown error)' }
-                    if ($descText.Length -gt 200) { $descText = $descText.Substring(0, 197) + '...' }
-
-                    $parts = @()
-                    if ($err.Item) { $parts += $err.Item }
-                    if ($desc -and $desc.path -and $desc.path -ne '/' -and $desc.path -ne '') { $parts += $desc.path }
-
-                    $allErrors += [PSCustomObject]@{
-                        Code       = ''
-                        Text       = $descText
-                        Filename   = $parts -join ' - '
-                        Seen       = [int]$err.Count
-                        LatestTime = [long]$err.Timestamp
-                        DataSource = $dsType
-                    }
-                }
-
-                if ($latestRaw.Count -gt 0) {
-                    $dsGrps = @($latestRaw | Group-Object { "$($_.Description)|$($_.Item)" } | Sort-Object { ($_.Group | Measure-Object -Property Count -Sum).Sum } -Descending)
-                    $dsMore = [Math]::Max(0, $dsGrps.Count - $TopN)
-                    $dsErrs = $dsGrps | Select-Object -First $TopN | ForEach-Object {
-                        $topE = $_.Group | Sort-Object Timestamp -Descending | Select-Object -First 1
-                        $dsc  = try { $topE.Description | ConvertFrom-Json } catch { $null }
-                        $txt  = if ($dsc -and $dsc.description) { $dsc.description } elseif ($topE.Description) { $topE.Description } else { '(unknown error)' }
-                        if ($txt.Length -gt 200) { $txt = $txt.Substring(0, 197) + '...' }
-                        $pts  = @()
-                        if ($topE.Item) { $pts += $topE.Item }
-                        if ($dsc -and $dsc.path -and $dsc.path -ne '/' -and $dsc.path -ne '') { $pts += $dsc.path }
-                        [PSCustomObject]@{ Code=''; Text=$txt; Filename=($pts -join ' - '); Seen=[int]$topE.Count; LatestTime=[long]$topE.Timestamp }
-                    }
-                    if (@($dsErrs).Count -eq 0) { continue }
-                    $dCodeKey = ($dsTypeMap.GetEnumerator() | Where-Object { $_.Value -eq $dsType } | Select-Object -First 1).Key
-                    $srcName  = if ($dCodeKey -and $dsNameMap.ContainsKey($dCodeKey)) { $dsNameMap[$dCodeKey] } else { $dsType }
-                    $m365SrcErrors += [PSCustomObject]@{ Name=$srcName; Errors=@($dsErrs); MoreCount=$dsMore }
+                $resp = Invoke-RestMethod -Uri $using:repUrl -Method Post -Body $body `
+                    -ContentType 'application/json' -Headers @{ Authorization = "Bearer $using:initVisa" } `
+                    -TimeoutSec 10
+                if ($resp.error) {
+                    [PSCustomObject]@{ DsType=$dsType; DsKey=$ds.Key; Items=@(); Ok=$false }
+                } else {
+                    [PSCustomObject]@{ DsType=$dsType; DsKey=$ds.Key; Items=@($resp.result.result); Ok=$true }
                 }
             } catch {
-                Write-Verbose "M365 error fetch failed for ${dsType}: $($_.Exception.Message)"
+                [PSCustomObject]@{ DsType=$dsType; DsKey=$ds.Key; Items=@(); Ok=$false }
+            }
+        } -ThrottleLimit 4
+
+        $allErrors     = @()
+        $m365SrcErrors = @()
+
+        foreach ($dsR in $dsResponses) {
+            if (-not $dsR.Ok -or $dsR.Items.Count -eq 0) { continue }
+
+            $dsType     = $dsR.DsType
+            $maxSession = ($dsR.Items | Measure-Object -Property SessionId -Maximum).Maximum
+            $latestRaw  = $dsR.Items | Where-Object { $_.SessionId -eq $maxSession }
+
+            foreach ($err in $latestRaw) {
+                $desc     = try { $err.Description | ConvertFrom-Json } catch { $null }
+                $descText = if ($desc -and $desc.description) { $desc.description } elseif ($err.Description) { $err.Description } else { '(unknown error)' }
+                if ($descText.Length -gt 200) { $descText = $descText.Substring(0, 197) + '...' }
+
+                $parts = @()
+                if ($err.Item) { $parts += $err.Item }
+                if ($desc -and $desc.path -and $desc.path -ne '/' -and $desc.path -ne '') { $parts += $desc.path }
+
+                $allErrors += [PSCustomObject]@{
+                    Code       = ''
+                    Text       = $descText
+                    Filename   = $parts -join ' - '
+                    Seen       = [int]$err.Count
+                    LatestTime = [long]$err.Timestamp
+                    DataSource = $dsType
+                }
+            }
+
+            if ($latestRaw.Count -gt 0) {
+                $dsGrps = @($latestRaw | Group-Object { "$($_.Description)|$($_.Item)" } | Sort-Object { ($_.Group | Measure-Object -Property Count -Sum).Sum } -Descending)
+                $dsMore = [Math]::Max(0, $dsGrps.Count - $TopN)
+                $dsErrs = $dsGrps | Select-Object -First $TopN | ForEach-Object {
+                    $topE = $_.Group | Sort-Object Timestamp -Descending | Select-Object -First 1
+                    $dsc  = try { $topE.Description | ConvertFrom-Json } catch { $null }
+                    $txt  = if ($dsc -and $dsc.description) { $dsc.description } elseif ($topE.Description) { $topE.Description } else { '(unknown error)' }
+                    if ($txt.Length -gt 200) { $txt = $txt.Substring(0, 197) + '...' }
+                    $pts  = @()
+                    if ($topE.Item) { $pts += $topE.Item }
+                    if ($dsc -and $dsc.path -and $dsc.path -ne '/' -and $dsc.path -ne '') { $pts += $dsc.path }
+                    [PSCustomObject]@{ Code=''; Text=$txt; Filename=($pts -join ' - '); Seen=[int]$topE.Count; LatestTime=[long]$topE.Timestamp }
+                }
+                if (@($dsErrs).Count -eq 0) { continue }
+                $srcName = if ($dsNameMap.ContainsKey($dsR.DsKey)) { $dsNameMap[$dsR.DsKey] } else { $dsType }
+                $m365SrcErrors += [PSCustomObject]@{ Name=$srcName; Errors=@($dsErrs); MoreCount=$dsMore }
             }
         }
 
@@ -799,16 +814,11 @@ function Get-CoveSessions {
             } | ConvertTo-Json -Depth 5 -Compress
         }
 
-        $sResp = $null
-        foreach ($delay in @(0, 3, 6)) {
-            if ($delay -gt 0) { Start-Sleep -Seconds $delay }
-            try {
-                $sResp = Invoke-RestMethod @qParams
-                if (-not $sResp.error) { break }
-                $sResp = $null
-            } catch { $sResp = $null }
+        $sResp = Invoke-WithRetry {
+            $r = Invoke-RestMethod @qParams
+            if ($r.error) { throw "QuerySessions error: $($r.error.message)" }
+            $r
         }
-        if (-not $sResp) { return $null }
 
         $rawSessions = @($sResp.result.result)
         if (-not $rawSessions -or $rawSessions.Count -eq 0) { return $null }
@@ -895,7 +905,7 @@ Export-ModuleMember -Function `
     Initialize-CoveApi, Set-CoveSession, `
     Connect-CoveApi, Get-CoveVisa, Get-CovePartnerId, `
     Invoke-CoveJsonrpc, Invoke-CoveParallel, `
-    Get-CovePartnerBranding, `
+    Get-CovePartnerInfo, Get-CovePartnerBranding, `
     Get-CoveDevices, `
     Get-CoveAccountInfo, `
     Get-CoveDeviceErrors, Get-CoveM365Errors, `

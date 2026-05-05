@@ -21,11 +21,12 @@ Import-Module (Join-Path $PSScriptRoot '../coveApi.psm1') -Force
 Connect-CoveApi -Username $Username -Password $Password | Out-Null
 
 if ($AccountId -eq 0) {
-    Write-Host "No -AccountId supplied, picking first device..." -ForegroundColor Cyan
+    Write-Host "No -AccountId supplied, picking a random device..." -ForegroundColor Cyan
     $devices   = Get-CoveDevices -Columns @('AU', 'AB')
     if (-not $devices -or $devices.Count -eq 0) { throw "No devices returned" }
-    $AccountId = [int]$devices[0].AccountId
-    Write-Host "  Using AccountId: $AccountId ($($devices[0].Name))" -ForegroundColor Gray
+    $picked    = $devices | Get-Random
+    $AccountId = [int]$picked.AccountId
+    Write-Host "  Using AccountId: $AccountId ($($picked.Name))" -ForegroundColor Gray
 }
 
 # Fetch endpoint once - reused by both calls via cache
