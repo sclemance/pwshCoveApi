@@ -141,15 +141,12 @@ function Set-CoveSession {
 function Connect-CoveApi {
     param(
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password,
-        [switch]$StoreForReAuth
+        [Parameter(Mandatory)][string]$Password
     )
-    if ($StoreForReAuth) {
-        $script:credential = [PSCredential]::new(
-            $Username,
-            ($Password | ConvertTo-SecureString -AsPlainText -Force)
-        )
-    }
+    $script:credential = [PSCredential]::new(
+        $Username,
+        ($Password | ConvertTo-SecureString -AsPlainText -Force)
+    )
     $body = @{
         jsonrpc = '2.0'; id = 'jsonrpc'; method = 'Login'
         params  = @{ username = $Username; password = $Password }
