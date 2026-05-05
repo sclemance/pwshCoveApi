@@ -34,20 +34,19 @@ Write-Host "  $($devices.Count) devices selected" -ForegroundColor Gray
 # Deliberately uses Invoke-CoveJsonrpc (a flat HTTP call) rather than
 # Get-CoveAccountInfo, which uses ForEach-Object -Parallel internally and
 # breaks when nested inside Start-ThreadJob runspaces.
-# Created via [scriptblock]::Create so it carries no SessionState binding and
-# executes in the invoking scope — the thread job's scope for parallel runs,
-# the script scope for the sequential run.
-$workBlock = [scriptblock]::Create(@'
-param($device)
-$resp = Invoke-CoveJsonrpc -Method 'GetAccountInfoById' -Params @{ accountId = $device.AccountId }
-[PSCustomObject]@{
-    AccountId = $device.AccountId
-    Name      = $device.Name
-    Resolved  = $null -ne $resp.result.result
-    PartnerId = Get-CovePartnerId
-    HasVisa   = -not [string]::IsNullOrEmpty((Get-CoveVisa))
+# Invoke-CoveParallel strips SessionState binding internally, so a plain
+# script block literal works correctly here.
+$workBlock = {
+    param($device)
+    $resp = Invoke-CoveJsonrpc -Method 'GetAccountInfoById' -Params @{ accountId = $device.AccountId }
+    [PSCustomObject]@{
+        AccountId = $device.AccountId
+        Name      = $device.Name
+        Resolved  = $null -ne $resp.result.result
+        PartnerId = Get-CovePartnerId
+        HasVisa   = -not [string]::IsNullOrEmpty((Get-CoveVisa))
+    }
 }
-'@)
 
 # --- Parallel run (first — cache cold, jobs have isolated scope) ---
 Write-Host "Running Invoke-CoveParallel (ThrottleLimit $ThrottleLimit)..." -ForegroundColor Cyan
