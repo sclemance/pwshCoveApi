@@ -1,8 +1,8 @@
 # pwshCoveApi
 
-PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.3.0**
+PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.4.0**
 
-Provides authentication, device enumeration, partner and per-device queries, and a parallel execution engine that handles visa distribution to thread jobs automatically.
+Provides authentication, device enumeration, partner and per-device queries, and a parallel execution engine that handles visa distribution to thread jobs automatically. Falls back to sequential execution in sandboxed environments where thread creation is restricted (e.g. Azure Automation).
 
 Requires PowerShell 7.4 or later.
 
@@ -140,6 +140,8 @@ $results = Invoke-CoveParallel -Items $devices -ThrottleLimit 20 -ScriptBlock {
 | `-ThrottleLimit` | int         | 20       |
 
 Returns an array of whatever the script block outputs, one entry per item. Items that fail return `$null`.
+
+**Sandboxed environments:** on the first call, the module probes whether `Start-ThreadJob` can create threads. If thread creation fails (e.g. Azure Automation), a warning is emitted and all subsequent calls — including `Get-CoveM365Errors` — run sequentially. The probe result is cached for the session so only one test job is ever attempted.
 
 ---
 

@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.3.0
+# coveApi.psm1 - v1.4.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,15 +11,16 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version       = "1.3.0"
-$script:apiUrl        = "https://api.backup.management/jsonapi"
-$script:reportingUrl  = "https://api.backup.management/reporting_api"
-$script:visa          = $null
-$script:partnerId     = 0
-$script:modulePath    = Join-Path $PSScriptRoot 'coveApi.psm1'
-$script:endpointCache = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
-$script:partnerCache  = [System.Collections.Concurrent.ConcurrentDictionary[long,object]]::new()
-$script:credential    = $null
+$script:version            = "1.4.0"
+$script:apiUrl             = "https://api.backup.management/jsonapi"
+$script:reportingUrl       = "https://api.backup.management/reporting_api"
+$script:visa               = $null
+$script:partnerId          = 0
+$script:modulePath         = Join-Path $PSScriptRoot 'coveApi.psm1'
+$script:endpointCache      = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new()
+$script:partnerCache       = [System.Collections.Concurrent.ConcurrentDictionary[long,object]]::new()
+$script:credential         = $null
+$script:threadingAvailable = $null   # $null = untested; probed on first Invoke-CoveParallel call
 
 # ============================================================
 # Private helpers
@@ -52,6 +53,23 @@ function Test-CoveAuthError {
     if (-not $Response -or -not $Response.error) { return $false }
     $msg = [string]$Response.error.message
     return $msg -imatch 'visa|session|expired|unauthorized|not authenticated'
+}
+
+# Probes whether Start-ThreadJob can create threads in this environment.
+# Result is cached for the lifetime of the module session.
+# Returns $false in sandboxed environments (e.g. Azure Automation) that restrict thread creation.
+function Test-ThreadingAvailable {
+    if ($null -ne $script:threadingAvailable) { return $script:threadingAvailable }
+    try {
+        $j = Start-ThreadJob -ScriptBlock { $true } -ErrorAction Stop
+        Receive-Job $j -Wait | Out-Null
+        Remove-Job $j -ErrorAction SilentlyContinue
+        $script:threadingAvailable = $true
+    } catch {
+        Write-Warning "Thread jobs unavailable - parallel calls will run sequentially: $_"
+        $script:threadingAvailable = $false
+    }
+    return $script:threadingAvailable
 }
 
 # Re-authenticates using the stored credential. Returns $true on success.
@@ -236,6 +254,13 @@ function Invoke-CoveParallel {
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [int]$ThrottleLimit = 20
     )
+
+    if (-not (Test-ThreadingAvailable)) {
+        $safeBlock = [scriptblock]::Create($ScriptBlock.ToString())
+        $results   = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Items) { $results.Add((& $safeBlock $item)) }
+        return $results.ToArray()
+    }
 
     $modPath      = $script:modulePath
     $apiUrl       = $script:apiUrl
@@ -622,23 +647,23 @@ function Get-CoveM365Errors {
         $cutoffTs = [long]((Get-Date).AddDays(-90) - [DateTime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)).TotalSeconds
         $initVisa = $currentVisa
 
-        # Fetch all active data sources in parallel; aggregate sequentially after.
-        $dsResponses = @($activeDs) | ForEach-Object -Parallel {
-            $ds     = $_
+        # Fetch all active data sources; parallel when threading is available, sequential otherwise.
+        $fetchDs = {
+            param($ds, $accountToken, $cutoff, $url, $visa)
             $dsType = $ds.Value
             $body   = @{
                 jsonrpc = '2.0'; id = 'jsonrpc'
                 method  = 'EnumerateSessionErrors'
                 params  = @{
-                    accountToken   = $using:AccountToken
+                    accountToken   = $accountToken
                     dataSourceType = $dsType
-                    filter         = @{ SessionType = 'Backup'; TimestampFrom = $using:cutoffTs }
+                    filter         = @{ SessionType = 'Backup'; TimestampFrom = $cutoff }
                     range          = @{ Offset = 0; Size = 50 }
                 }
             } | ConvertTo-Json -Depth 10 -Compress
             try {
-                $resp = Invoke-RestMethod -Uri $using:repUrl -Method Post -Body $body `
-                    -ContentType 'application/json' -Headers @{ Authorization = "Bearer $using:initVisa" } `
+                $resp = Invoke-RestMethod -Uri $url -Method Post -Body $body `
+                    -ContentType 'application/json' -Headers @{ Authorization = "Bearer $visa" } `
                     -TimeoutSec 10
                 if ($resp.error) {
                     [PSCustomObject]@{ DsType=$dsType; DsKey=$ds.Key; Items=@(); Ok=$false }
@@ -648,7 +673,15 @@ function Get-CoveM365Errors {
             } catch {
                 [PSCustomObject]@{ DsType=$dsType; DsKey=$ds.Key; Items=@(); Ok=$false }
             }
-        } -ThrottleLimit 4
+        }
+
+        $dsResponses = if (Test-ThreadingAvailable) {
+            @($activeDs) | ForEach-Object -Parallel {
+                & $using:fetchDs $_ $using:AccountToken $using:cutoffTs $using:repUrl $using:initVisa
+            } -ThrottleLimit 4
+        } else {
+            @($activeDs) | ForEach-Object { & $fetchDs $_ $AccountToken $cutoffTs $repUrl $initVisa }
+        }
 
         $allErrors     = @()
         $m365SrcErrors = @()
