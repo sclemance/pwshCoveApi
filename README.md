@@ -1,6 +1,6 @@
 # pwshCoveApi
 
-PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.4.0**
+PowerShell module for the [Cove Data Protection](https://www.n-able.com/products/cove-data-protection) API. Current version: **v1.5.0**
 
 Provides authentication, device enumeration, partner and per-device queries, and a parallel execution engine that handles visa distribution to thread jobs automatically. Falls back to sequential execution in sandboxed environments where thread creation is restricted (e.g. Azure Automation).
 
@@ -100,7 +100,7 @@ $partnerId = Get-CovePartnerId
 
 #### `Invoke-CoveJsonrpc`
 
-Sends a JSON-RPC request to the main API endpoint. Retries automatically on transient failures. Use this for methods not covered by a dedicated function.
+Sends a JSON-RPC request to the main API endpoint. Retries automatically on transient failures (up to 3 attempts, exponential backoff). On HTTP 429, the retry delay honours the `Retry-After` response header if present; the normal maximum delay cap does not apply to server-specified wait times. Use this for methods not covered by a dedicated function.
 
 ```powershell
 $resp = Invoke-CoveJsonrpc -Method 'SomeMethod' -Params @{ key = 'value' }
@@ -139,7 +139,9 @@ $results = Invoke-CoveParallel -Items $devices -ThrottleLimit 20 -ScriptBlock {
 | `-ScriptBlock`   | scriptblock | Required |
 | `-ThrottleLimit` | int         | 20       |
 
-Returns an array of whatever the script block outputs, one entry per item. Items that fail return `$null`.
+Returns an array of whatever the script block outputs, one entry per item. Items whose job fails (after retries) return `$null` in the result set — callers should verify the result count matches the input count if completeness is required.
+
+**Retry behaviour:** all Cove API calls made inside the script block go through `Invoke-CoveJsonrpc`, which retries on transient failures including 429 rate-limit responses (honouring `Retry-After`). If a job still fails after the maximum attempts, it produces a `$null` entry rather than throwing.
 
 **Sandboxed environments:** on the first call, the module probes whether `Start-ThreadJob` can create threads. If thread creation fails (e.g. Azure Automation), a warning is emitted and all subsequent calls — including `Get-CoveM365Errors` — run sequentially. The probe result is cached for the session so only one test job is ever attempted.
 

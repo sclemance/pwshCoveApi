@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.4.0
+# coveApi.psm1 - v1.5.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,7 +11,7 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version            = "1.4.0"
+$script:version            = "1.5.0"
 $script:apiUrl             = "https://api.backup.management/jsonapi"
 $script:reportingUrl       = "https://api.backup.management/reporting_api"
 $script:visa               = $null
@@ -40,8 +40,15 @@ function Invoke-WithRetry {
             return & $Action
         } catch {
             if ($attempt -ge $MaxAttempts) { throw }
-            $delay = [Math]::Min($BaseDelaySec * [Math]::Pow(2, $attempt - 1), $MaxDelaySec)
-            Write-Verbose "Attempt $attempt failed. Retrying in ${delay}s..."
+            $code  = [int]$_.Exception.Response.StatusCode
+            # For 429, honour the server's Retry-After if present; MaxDelaySec cap does not apply.
+            $delay = if ($code -eq 429) {
+                $secs = $_.Exception.Response.Headers.RetryAfter?.Delta?.TotalSeconds
+                if ($secs -gt 0) { [int]$secs } else { [Math]::Min($BaseDelaySec * [Math]::Pow(2, $attempt - 1), $MaxDelaySec) }
+            } else {
+                [Math]::Min($BaseDelaySec * [Math]::Pow(2, $attempt - 1), $MaxDelaySec)
+            }
+            Write-Verbose "Attempt $attempt failed$(if ($code -eq 429) { ' (429 rate-limited)' }). Retrying in ${delay}s..."
             Start-Sleep -Seconds $delay
         }
     }
