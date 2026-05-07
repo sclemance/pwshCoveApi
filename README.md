@@ -59,6 +59,21 @@ Initialize-CoveApi -ApiUrl 'https://api.backup.management/jsonapi' `
 
 Call before `Connect-CoveApi` if you need non-default endpoints.
 
+#### `Set-CoveSession`
+
+Restores module session state from an existing visa without re-authenticating. Used internally by `Invoke-CoveParallel` to initialize each thread job — not intended for direct use.
+
+```powershell
+Set-CoveSession -Visa $visa -PartnerId $partnerId
+Set-CoveSession -Visa $visa -PartnerId $partnerId -Credential $cred
+```
+
+| Parameter      | Type          | Required |
+|----------------|---------------|----------|
+| `-Visa`        | string        | Yes      |
+| `-PartnerId`   | long          | Yes      |
+| `-Credential`  | PSCredential  | No       |
+
 ---
 
 ### Authentication
@@ -106,11 +121,12 @@ Sends a JSON-RPC request to the main API endpoint. Retries automatically on tran
 $resp = Invoke-CoveJsonrpc -Method 'SomeMethod' -Params @{ key = 'value' }
 ```
 
-| Parameter | Type      | Default     |
-|-----------|-----------|-------------|
-| `-Method` | string    | Required    |
-| `-Params` | hashtable | Required    |
-| `-Visa`   | string    | stored visa |
+| Parameter      | Type      | Default     |
+|----------------|-----------|-------------|
+| `-Method`      | string    | Required    |
+| `-Params`      | hashtable | Required    |
+| `-Visa`        | string    | stored visa |
+| `-TimeoutSec`  | int       | 30          |
 
 ---
 

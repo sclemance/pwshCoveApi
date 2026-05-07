@@ -210,7 +210,8 @@ function Invoke-CoveJsonrpc {
     param(
         [Parameter(Mandatory)][string]$Method,
         [Parameter(Mandatory)][hashtable]$Params,
-        [string]$Visa = $script:visa
+        [string]$Visa      = $script:visa,
+        [int]$TimeoutSec   = 30
     )
     $body = [ordered]@{
         jsonrpc = '2.0'
@@ -225,7 +226,7 @@ function Invoke-CoveJsonrpc {
         Method      = 'Post'
         ContentType = 'application/json'
         Body        = $body
-        TimeoutSec  = 30
+        TimeoutSec  = $TimeoutSec
     }
     $resp = Invoke-WithRetry { Invoke-RestMethod @reqParams }
 
@@ -387,21 +388,9 @@ function Get-CoveDevices {
         [long]$PartnerId   = $script:partnerId,
         [int]$RecordsCount = 10000
     )
-    $body = @{
-        jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
-        method  = 'EnumerateAccountStatistics'
-        params  = @{ query = @{ PartnerId = $PartnerId; RecordsCount = $RecordsCount; Columns = $Columns } }
-    } | ConvertTo-Json -Depth 10 -Compress
-
-    $params = @{
-        Uri         = $script:apiUrl
-        Method      = 'Post'
-        Body        = $body
-        ContentType = 'application/json'
-        TimeoutSec  = 60
-        ErrorAction = 'Stop'
-    }
-    $resp = Invoke-RestMethod @params
+    $resp = Invoke-CoveJsonrpc -Method 'EnumerateAccountStatistics' `
+        -Params @{ query = @{ PartnerId = $PartnerId; RecordsCount = $RecordsCount; Columns = $Columns } } `
+        -Visa $Visa -TimeoutSec 60
     return $resp.result.result
 }
 
@@ -411,7 +400,8 @@ function Get-CoveDevices {
 
 # Returns Name, Token, and RepservUrl for a device account.
 # RepservUrl is derived from EnumerateAccountRemoteAccessEndpoints.
-# Both API calls run simultaneously via ForEach-Object -Parallel.
+# The two API calls run sequentially — nesting ForEach-Object -Parallel inside
+# a Start-ThreadJob (the Invoke-CoveParallel context) is not safe in PS 7.
 # Results are cached in module scope - repeated calls for the same AccountId
 # within the same session (or thread job) return immediately from cache.
 # Returns $null if the account cannot be resolved.
@@ -582,7 +572,7 @@ function Get-CoveDeviceErrors {
                     $sourceErrors += [PSCustomObject]@{ Name=$srcName; Errors=@($srcErrs); MoreCount=$srcMore }
                 }
             }
-        } catch { }
+        } catch { Write-Verbose "Get-CoveDeviceErrors source-errors: $_" }
 
         return [PSCustomObject]@{
             LatestSession = @($latestSession)
