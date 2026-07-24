@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.5.0
+# coveApi.psm1 - v1.6.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,7 +11,7 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version            = "1.5.0"
+$script:version            = "1.6.0"
 $script:apiUrl             = "https://api.backup.management/jsonapi"
 $script:reportingUrl       = "https://api.backup.management/reporting_api"
 $script:visa               = $null
@@ -840,8 +840,8 @@ function Get-CoveSessionProgress {
 # ============================================================
 
 # Returns a list of session objects for a device.
-# Each object: SrcCode (string), StartTimeUnix (long), EndTimeUnix (long),
-#   Status (int, normalized), SelectedSize (long, bytes).
+# Each object: SessionId (long), SrcCode (string), StartTimeUnix (long),
+#   EndTimeUnix (long), Status (int, normalized), SelectedSize (long, bytes).
 # Status codes: 1=InProgress, 2=Failed, 3=Aborted, 5=Success, 6=Interrupted,
 #   7=NotStarted, 8=CompletedWithErrors, 9=InProgressWithFaults, 10=OverQuota,
 #   12=Restarted, 13=Blocked.
@@ -926,7 +926,14 @@ function Get-CoveSessions {
                 default                { 0  }
             }
             if ($status -eq 0) { continue }
+            # Session id (QueryErrors rows reference it via their SessionId field),
+            # so callers can join per-session error text. Field name varies by API
+            # surface (repserv 'Id' vs main API 'SessionId'); accept either.
+            $sid = if ($sess.PSObject.Properties['Id'])          { [long]$sess.Id }
+                   elseif ($sess.PSObject.Properties['SessionId']) { [long]$sess.SessionId }
+                   else { [long]0 }
             $result.Add([PSCustomObject]@{
+                SessionId     = $sid
                 SrcCode       = $srcCode
                 StartTimeUnix = [long]$sess.StartTime
                 EndTimeUnix   = [long]$sess.EndTime
@@ -936,6 +943,61 @@ function Get-CoveSessions {
         }
         return $result
     } catch { return $null }
+}
+
+# Returns a hashtable mapping a session id -> a representative error text for that
+# session, over the window Time >= StartTime (0 = all available). Built from raw
+# QueryErrors rows (which carry SessionId), grouping per session and picking the
+# most frequent message (tie-break latest). Lets callers attach a per-session
+# failure cause to Get-CoveSessions rows via their SessionId. Empty map on any
+# failure - cause enrichment is best-effort.
+function Get-CoveSessionErrorMap {
+    param(
+        [Parameter(Mandatory)][int]$AccountId,
+        [string]$Visa        = $script:visa,
+        [long]$StartTime     = 0,
+        [hashtable]$Endpoint = $null
+    )
+    $map = @{}
+    try {
+        if (-not $Endpoint) { $Endpoint = Get-CoveAccountInfo -AccountId $AccountId -Visa $Visa }
+        if (-not $Endpoint -or -not $Endpoint.RepservUrl) { return $map }
+
+        $query   = if ($StartTime -gt 0) { "Time >= $StartTime" } else { "Time >= 0" }
+        $qParams = @{
+            Uri         = $Endpoint.RepservUrl
+            Method      = 'Post'
+            ContentType = 'application/json'
+            TimeoutSec  = 15
+            Body        = @{
+                jsonrpc = '2.0'; id = 'jsonrpc'; visa = $Visa
+                method  = 'QueryErrors'
+                params  = @{
+                    accountId = $AccountId; account = $Endpoint.Name; sessionId = 0
+                    query = $query; orderBy = 'Time DESC'; groupId = 0; token = $Endpoint.Token
+                }
+            } | ConvertTo-Json -Depth 5 -Compress
+        }
+
+        $resp = Invoke-WithRetry {
+            $r = Invoke-RestMethod @qParams
+            if ($r.error) { throw "QueryErrors error: $($r.error.message)" }
+            $r
+        }
+        $errs = @($resp.result.result)
+        if ($errs.Count -eq 0) { return $map }
+
+        foreach ($grp in ($errs | Group-Object SessionId)) {
+            if (-not $grp.Name) { continue }
+            $sid = [long]$grp.Name
+            $rep = $grp.Group | Group-Object { "$($_.Text)" } | Sort-Object Count -Descending | Select-Object -First 1
+            if ($rep) {
+                $txt = [string](($rep.Group | Sort-Object Time -Descending | Select-Object -First 1).Text)
+                if ($txt) { $map[$sid] = $txt }
+            }
+        }
+    } catch { return $map }
+    return $map
 }
 
 # ============================================================
@@ -979,5 +1041,5 @@ Export-ModuleMember -Function `
     Get-CoveDevices, `
     Get-CoveAccountInfo, `
     Get-CoveDeviceErrors, Get-CoveM365Errors, `
-    Get-CoveSessionProgress, Get-CoveSessions, `
+    Get-CoveSessionProgress, Get-CoveSessions, Get-CoveSessionErrorMap, `
     Set-CoveDeviceCustomColumn
