@@ -1,5 +1,5 @@
 #Requires -Version 7.4
-# coveApi.psm1 - v1.6.0
+# coveApi.psm1 - v1.7.0
 # Cove Data Protection API: authentication, device enumeration, per-device queries, parallel execution.
 #
 # Quick start:
@@ -11,7 +11,7 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version            = "1.6.0"
+$script:version            = "1.7.0"
 $script:apiUrl             = "https://api.backup.management/jsonapi"
 $script:reportingUrl       = "https://api.backup.management/reporting_api"
 $script:visa               = $null
@@ -1033,6 +1033,100 @@ function Set-CoveDeviceCustomColumn {
     if ($resp.error) { throw "Cove error: $($resp.error.message)" }
 }
 
+
+# Returns per-session M365 backup history for one device via the reporting API's
+# EnumerateSessions method, mapped to the SAME shape Get-CoveSessions returns
+# (SessionId, SrcCode, StartTimeUnix, EndTimeUnix, Status, SelectedSize) so the
+# outcome mapper is shared between on-prem and cloud-to-cloud capture.
+#
+# Two differences from the on-prem QuerySessions path, both deliberate:
+#   Status is the native STRING (Completed / CompletedWithErrors / Interrupted /
+#   Failed), not the 0-13 integer enum -- callers resolve it with
+#   Get-CoveM365Outcome. SelectedSize is $null: EnumerateSessions carries no
+#   size, which comes from the per-service device columns instead.
+#
+# Observed behaviour: roughly 4 sessions per day per service, with at least 400
+# days of retention. Only COMPLETED sessions are returned -- no in-flight session
+# has been observed -- so a caller relying on a high-water mark needs a lookback
+# margin: a session that starts before, but finishes after, one already captured
+# becomes visible only later and would otherwise be skipped forever.
+#
+# Requires accountToken (Get-CoveAccountInfo returns it, cached) and sends the
+# visa as an Authorization: Bearer header, not in the request body.
+function Get-CoveM365Sessions {
+    param(
+        [Parameter(Mandatory)][int]$AccountId,
+        [Parameter(Mandatory)][string]$Visa,
+        [string]$AccountToken = $null,
+        [long]$StartTime      = 0,
+        [long]$EndTime        = 0,
+        [int]$PageSize        = 500,
+        [int]$MaxPages        = 40
+    )
+
+    $dsCodeMap = @{ 'Exchange' = 'D19'; 'OneDrive' = 'D20'; 'SharePoint' = 'D05'; 'Teams' = 'D23' }
+    $result    = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        $currentVisa = $Visa
+        if (-not $AccountToken) {
+            $info = Get-CoveAccountInfo -AccountId $AccountId -Visa $Visa
+            if (-not $info -or -not $info.Token) { return @() }
+            $AccountToken = $info.Token
+        }
+
+        $headers = @{ Authorization = "Bearer $currentVisa" }
+        $nowTs   = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        $from    = if ($StartTime -gt 0) { $StartTime } else { $nowTs - (30 * 86400) }
+        $to      = if ($EndTime   -gt 0) { $EndTime   } else { $nowTs }
+
+        $offset = 0
+        for ($page = 0; $page -lt $MaxPages; $page++) {
+            $body = @{
+                jsonrpc = "2.0"; id = "jsonrpc"
+                method  = "EnumerateSessions"
+                params  = @{
+                    accountToken = $AccountToken
+                    range        = @{ Offset = $offset; Size = $PageSize }
+                    filter       = @{ CreatedAfter = $from; CreatedBefore = $to }
+                }
+            } | ConvertTo-Json -Depth 10
+
+            $resp = Invoke-RestMethod -Uri $script:reportingUrl -Method Post -Body $body `
+                        -ContentType "application/json" -Headers $headers -TimeoutSec 30
+            if ($resp.visa) { $headers = @{ Authorization = "Bearer $($resp.visa)" } }
+            if ($resp.error) { break }
+
+            $batch = @()
+            if     ($resp.result.result) { $batch = @($resp.result.result) }
+            elseif ($resp.result)        { $batch = @($resp.result) }
+            $batch = @($batch | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Status' })
+            if ($batch.Count -eq 0) { break }
+
+            foreach ($s in $batch) {
+                $dsType  = "$($s.DataSourceType)"
+                $srcCode = if ($dsCodeMap.ContainsKey($dsType)) { $dsCodeMap[$dsType] } else { $dsType }
+                $result.Add([PSCustomObject]@{
+                    SessionId     = if ($s.Id) { [long]$s.Id } else { 0L }
+                    SrcCode       = $srcCode
+                    StartTimeUnix = [long]$s.StartTime
+                    EndTimeUnix   = if ($s.EndTime) { [long]$s.EndTime } else { 0L }
+                    Status        = "$($s.Status)"
+                    SelectedSize  = $null
+                    ErrorsCount   = if ($s.ErrorsCount) { [int]$s.ErrorsCount } else { 0 }
+                })
+            }
+
+            if ($batch.Count -lt $PageSize) { break }
+            $offset += $PageSize
+        }
+    } catch {
+        Write-Verbose "Get-CoveM365Sessions failed for account ${AccountId}: $_"
+        return @()
+    }
+
+    return $result
+}
 Export-ModuleMember -Function `
     Initialize-CoveApi, Set-CoveSession, `
     Connect-CoveApi, Get-CoveVisa, Get-CovePartnerId, `
@@ -1040,6 +1134,6 @@ Export-ModuleMember -Function `
     Get-CovePartnerInfo, Get-CovePartnerBranding, `
     Get-CoveDevices, `
     Get-CoveAccountInfo, `
-    Get-CoveDeviceErrors, Get-CoveM365Errors, `
+    Get-CoveDeviceErrors, Get-CoveM365Errors, Get-CoveM365Sessions, `
     Get-CoveSessionProgress, Get-CoveSessions, Get-CoveSessionErrorMap, `
     Set-CoveDeviceCustomColumn
