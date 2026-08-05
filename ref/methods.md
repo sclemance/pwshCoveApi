@@ -126,7 +126,7 @@ Methods already wrapped by `coveApi.psm1` are omitted: `Login`, `EnumerateAccoun
 
 | Method | Description | Key params |
 |--------|-------------|------------|
-| `EnumerateAggregatedStatisticsHistory` | Daily time-series rollup for a partner | `query.PartnerId`, `query.From` (Unix), `query.To` (Unix), `query.Aggregates` (int[]) — see aggregate ID table in `backup-monitor/docs/cove-api.md` |
+| `EnumerateAggregatedStatisticsHistory` | Daily time-series rollup for a partner | `query.PartnerId`, `query.From` (Unix), `query.To` (Unix), `query.Aggregates` (int[]) — integer aggregate IDs selecting which measures to return; the set is undocumented by the vendor and must be established empirically |
 
 **Scope:** `PartnerId` accepts customer-level IDs (the `I83` column value) to scope to one customer. **Limitation:** no aggregate exists for backup success/failure counts — only storage sizes, device counts, and data-source counts.
 

@@ -240,6 +240,29 @@ $info = Get-CoveAccountInfo -AccountId 12345
 | `-AccountId` | int    | Required    |
 | `-Visa`      | string | stored visa |
 
+#### `Get-CoveProtectedUsers`
+
+Per-account protection statistics for one **cloud-to-cloud (Microsoft 365)** device. A c2c device is a tenant, so this returns one entry per protected account in it. The endpoint has no filter or paging parameters — the full set comes back and the caller narrows it.
+
+Each entry carries `userId`, `displayName`, `emailAddress`, `shared`, `deleted`, and `dataSources[]` of `{ id, licensed, status }`. `expand=deleted,licensed` is sent automatically; without it the account-level `deleted` flag and the per-service `licensed` flag are both absent.
+
+The response contains personal data (names and email addresses). Reduce it to whatever aggregate you need rather than storing it wholesale.
+
+```powershell
+$accounts = Get-CoveProtectedUsers -DeviceId 5335399
+$licensedExchange = @($accounts | Where-Object {
+    $_.dataSources | Where-Object { $_.id -eq 19 -and $_.licensed }
+}).Count
+```
+
+| Parameter     | Type   | Default     |
+|---------------|--------|-------------|
+| `-DeviceId`   | int    | Required    |
+| `-Visa`       | string | stored visa |
+| `-TimeoutSec` | int    | 60          |
+
+Uses the c2c base URL (`https://api.backup.management/c2c`), overridable via `Initialize-CoveApi -C2CUrl`.
+
 #### `Get-CoveDeviceErrors`
 
 Returns error history from the repserv endpoint for a device. Queries the last 90 days.

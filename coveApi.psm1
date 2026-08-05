@@ -11,9 +11,10 @@
 #       Get-CoveDeviceErrors -AccountId $device.AccountId
 #   }
 
-$script:version            = "1.7.0"
+$script:version            = "1.8.0"
 $script:apiUrl             = "https://api.backup.management/jsonapi"
 $script:reportingUrl       = "https://api.backup.management/reporting_api"
+$script:c2cUrl             = "https://api.backup.management/c2c"
 $script:visa               = $null
 $script:partnerId          = 0
 $script:modulePath         = Join-Path $PSScriptRoot 'coveApi.psm1'
@@ -140,10 +141,12 @@ $script:dCodeNames = @{
 function Initialize-CoveApi {
     param(
         [string]$ApiUrl       = "https://api.backup.management/jsonapi",
-        [string]$ReportingUrl = "https://api.backup.management/reporting_api"
+        [string]$ReportingUrl = "https://api.backup.management/reporting_api",
+        [string]$C2CUrl       = "https://api.backup.management/c2c"
     )
     $script:apiUrl       = $ApiUrl
     $script:reportingUrl = $ReportingUrl
+    $script:c2cUrl       = $C2CUrl
 }
 
 # Restores session state from an existing visa without re-authenticating.
@@ -1127,13 +1130,48 @@ function Get-CoveM365Sessions {
 
     return $result
 }
+# ============================================================
+# Cloud-to-cloud (Microsoft 365) protected users
+# ============================================================
+
+# Per-account protection statistics for one cloud-to-cloud device.
+#
+# A c2c "device" is a tenant, so this returns one entry per protected account in
+# that tenant. There are no filter or paging parameters - the endpoint returns
+# the full set, and callers narrow it themselves.
+#
+# expand=deleted,licensed is required. Without it the account-level `deleted`
+# flag and the per-service `licensed` flag are both absent, and those are two of
+# the three facets that distinguish an account worth billing from one that is
+# merely present.
+#
+# Returns the raw deviceStatistics array. Each entry carries userId,
+# displayName, emailAddress, shared, deleted, and dataSources[] of
+# { id, licensed, status }. The response contains personal data (names and
+# email addresses), so callers should reduce it to whatever aggregate they need
+# rather than storing it wholesale.
+function Get-CoveProtectedUsers {
+    param(
+        [Parameter(Mandatory)][int]$DeviceId,
+        [string]$Visa = $null,
+        [int]$TimeoutSec = 60
+    )
+    $v = if ($Visa) { $Visa } else { $script:visa }
+    if (-not $v) { throw "No Cove visa available - call Connect-CoveApi first." }
+
+    $uri = "$($script:c2cUrl)/statistics/devices/id/$DeviceId`?expand=deleted,licensed"
+    $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec $TimeoutSec -ErrorAction Stop `
+                -Headers @{ Authorization = "Bearer $v"; Accept = 'application/json' }
+    return @($resp.deviceStatistics)
+}
+
 Export-ModuleMember -Function `
     Initialize-CoveApi, Set-CoveSession, `
     Connect-CoveApi, Get-CoveVisa, Get-CovePartnerId, `
     Invoke-CoveJsonrpc, Invoke-CoveParallel, `
     Get-CovePartnerInfo, Get-CovePartnerBranding, `
     Get-CoveDevices, `
-    Get-CoveAccountInfo, `
+    Get-CoveAccountInfo, Get-CoveProtectedUsers, `
     Get-CoveDeviceErrors, Get-CoveM365Errors, Get-CoveM365Sessions, `
     Get-CoveSessionProgress, Get-CoveSessions, Get-CoveSessionErrorMap, `
     Set-CoveDeviceCustomColumn
